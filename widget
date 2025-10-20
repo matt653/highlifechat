@@ -1,0 +1,485 @@
+// --- Live Chat CRM Widget ---
+// This script creates a complete chat widget and connects it to a Firebase Firestore backend.
+
+(function() {
+    // --- 1. CONFIGURATION ---
+    const APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const FIREBASE_CONFIG = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+    let db, auth;
+
+    // --- 2. STATE MANAGEMENT ---
+    let state = {
+        userId: null,
+        leadId: null,
+        chatOpen: false,
+        leadCaptured: false,
+        websiteUrlForAI: null,
+        isAITyping: false,
+    };
+
+    // --- 3. FIREBASE INITIALIZATION ---
+    function initializeFirebase() {
+        if (!FIREBASE_CONFIG) {
+            console.error("Firebase config is missing.");
+            return;
+        }
+
+        // Dynamically import Firebase modules
+        Promise.all([
+            import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"),
+            import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"),
+            import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js")
+        ]).then(([{
+            initializeApp
+        }, {
+            getAuth,
+            signInAnonymously
+        }, {
+            getFirestore,
+            doc,
+            setDoc,
+            addDoc,
+            collection,
+            serverTimestamp,
+            getDoc
+        }]) => {
+            const app = initializeApp(FIREBASE_CONFIG);
+            auth = getAuth(app);
+            db = getFirestore(app);
+
+            signInAnonymously(auth).catch(error => {
+                console.error("Anonymous sign-in failed:", error);
+            });
+
+            auth.onAuthStateChanged(user => {
+                if (user) {
+                    state.userId = user.uid;
+                    loadExistingLead();
+                    fetchWebsiteUrl();
+                }
+            });
+        }).catch(error => console.error("Error loading Firebase modules:", error));
+    }
+
+    // --- 4. UI CREATION (HTML & CSS) ---
+    function createChatUI() {
+        const style = document.createElement('style');
+        style.textContent = `
+            :root { --chat-primary-color: #007bff; --chat-secondary-color: #f0f0f0; }
+            #chat-bubble {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                width: 60px;
+                height: 60px;
+                background-color: var(--chat-primary-color);
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+                transition: transform 0.2s ease-in-out;
+                z-index: 9998;
+            }
+            #chat-bubble:hover { transform: scale(1.1); }
+            #chat-bubble svg { color: white; width: 32px; height: 32px; }
+            #chat-container {
+                position: fixed;
+                bottom: 100px;
+                right: 20px;
+                width: 90%;
+                max-width: 370px;
+                height: 70vh;
+                max-height: 600px;
+                background: white;
+                border-radius: 15px;
+                box-shadow: 0 5px 20px rgba(0,0,0,0.2);
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                transform: scale(0);
+                transform-origin: bottom right;
+                transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                z-index: 9999;
+            }
+            #chat-container.open { transform: scale(1); }
+            .chat-header {
+                background: var(--chat-primary-color);
+                color: white;
+                padding: 15px;
+                font-family: sans-serif;
+                border-radius: 15px 15px 0 0;
+            }
+            .chat-header h3 { margin: 0; font-size: 1.1em; }
+            .chat-header p { margin: 5px 0 0; font-size: 0.8em; opacity: 0.9; }
+            .chat-messages {
+                flex-grow: 1;
+                padding: 15px;
+                overflow-y: auto;
+                background-color: #f9f9f9;
+                display: flex;
+                flex-direction: column;
+            }
+            .message {
+                margin-bottom: 10px;
+                padding: 10px 15px;
+                border-radius: 18px;
+                max-width: 80%;
+                font-family: sans-serif;
+                font-size: 0.95em;
+                line-height: 1.4;
+            }
+            .message.user {
+                background-color: var(--chat-primary-color);
+                color: white;
+                align-self: flex-end;
+                border-bottom-right-radius: 4px;
+            }
+            .message.agent {
+                background-color: var(--chat-secondary-color);
+                color: #333;
+                align-self: flex-start;
+                border-bottom-left-radius: 4px;
+            }
+            .message.typing {
+                font-style: italic;
+                color: #888;
+            }
+            .chat-input-area, .lead-form {
+                padding: 15px;
+                background: white;
+                border-top: 1px solid #ddd;
+            }
+            .chat-input-area { display: flex; }
+            .chat-input-area input, .lead-form input {
+                width: 100%;
+                padding: 10px;
+                border: 1px solid #ccc;
+                border-radius: 8px;
+                font-size: 1em;
+                font-family: sans-serif;
+            }
+            .lead-form input { margin-bottom: 10px; }
+            .lead-form button, .chat-input-area button {
+                padding: 10px 15px;
+                border: none;
+                background: var(--chat-primary-color);
+                color: white;
+                border-radius: 8px;
+                cursor: pointer;
+                font-size: 1em;
+            }
+            .chat-input-area button {
+                margin-left: 10px;
+            }
+            @media (max-width: 480px) {
+                #chat-container {
+                    bottom: 0;
+                    right: 0;
+                    width: 100%;
+                    height: 100%;
+                    max-width: 100%;
+                    max-height: 100%;
+                    border-radius: 0;
+                }
+                #chat-bubble {
+                    bottom: 15px;
+                    right: 15px;
+                }
+            }
+        `;
+
+        const chatBubbleHTML = `
+            <div id="chat-bubble">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.76c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.076-4.076a1.526 1.526 0 011.037-.443 48.282 48.282 0 005.68-.494c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
+                </svg>
+            </div>
+        `;
+
+        const chatContainerHTML = `
+            <div id="chat-container">
+                <div class="chat-header">
+                    <h3>Sales Agent</h3>
+                    <p>We're here to help!</p>
+                </div>
+                <div class="chat-messages" id="chat-messages">
+                    <div class="message agent">Hello! How can we help you today?</div>
+                </div>
+                <div class="chat-content-area">
+                    <!-- This area will be dynamically filled -->
+                </div>
+            </div>
+        `;
+        document.head.appendChild(style);
+        document.body.insertAdjacentHTML('beforeend', chatBubbleHTML);
+        document.body.insertAdjacentHTML('beforeend', chatContainerHTML);
+        
+        renderInitialView();
+    }
+
+    // --- 5. UI LOGIC & RENDERING ---
+    function toggleChat() {
+        state.chatOpen = !state.chatOpen;
+        const container = document.getElementById('chat-container');
+        container.classList.toggle('open', state.chatOpen);
+    }
+
+    function renderInitialView() {
+        if (state.leadCaptured) {
+            renderChatInput();
+        } else {
+            renderLeadForm();
+        }
+    }
+
+    function renderLeadForm() {
+        const contentArea = document.querySelector('.chat-content-area');
+        contentArea.innerHTML = `
+            <div class="lead-form" id="lead-form">
+                <input type="text" id="lead-name" placeholder="Your Name" required>
+                <input type="email" id="lead-email" placeholder="Your Email" required>
+                <input type="text" id="lead-message" placeholder="Your Message" required>
+                <button id="lead-submit">Start Chat</button>
+            </div>
+        `;
+    }
+
+    function renderChatInput() {
+        const contentArea = document.querySelector('.chat-content-area');
+        contentArea.innerHTML = `
+            <div class="chat-input-area" id="chat-input-area">
+                <input type="text" id="chat-message-input" placeholder="Type your message...">
+                <button id="chat-send-btn">Send</button>
+            </div>
+        `;
+    }
+
+    function addMessageToUI(text, sender) {
+        const messagesContainer = document.getElementById('chat-messages');
+        const messageDiv = document.createElement('div');
+        messageDiv.className = `message ${sender}`;
+        messageDiv.textContent = text;
+        messagesContainer.appendChild(messageDiv);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+
+    function showAITyping(show) {
+        const messagesContainer = document.getElementById('chat-messages');
+        let typingIndicator = document.getElementById('ai-typing-indicator');
+
+        if (show && !typingIndicator) {
+            state.isAITyping = true;
+            typingIndicator = document.createElement('div');
+            typingIndicator.id = 'ai-typing-indicator';
+            typingIndicator.className = 'message agent typing';
+            typingIndicator.textContent = 'AI is typing...';
+            messagesContainer.appendChild(typingIndicator);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        } else if (!show && typingIndicator) {
+            state.isAITyping = false;
+            typingIndicator.remove();
+        }
+    }
+
+
+    // --- 6. EVENT LISTENERS ---
+    function addEventListeners() {
+        document.getElementById('chat-bubble').addEventListener('click', toggleChat);
+
+        document.body.addEventListener('click', async (e) => {
+            if (e.target.id === 'lead-submit') {
+                e.preventDefault();
+                await handleLeadSubmit();
+            }
+            if (e.target.id === 'chat-send-btn') {
+                e.preventDefault();
+                await handleSendMessage();
+            }
+        });
+
+        document.body.addEventListener('keypress', async (e) => {
+             if (e.target.id === 'chat-message-input' && e.key === 'Enter') {
+                e.preventDefault();
+                await handleSendMessage();
+            }
+             if (e.target.id === 'lead-message' && e.key === 'Enter') {
+                e.preventDefault();
+                await handleLeadSubmit();
+            }
+        });
+    }
+
+    // --- 7. CORE LOGIC & DATA HANDLING ---
+    async function handleLeadSubmit() {
+        const nameInput = document.getElementById('lead-name');
+        const emailInput = document.getElementById('lead-email');
+        const messageInput = document.getElementById('lead-message');
+
+        const name = nameInput.value.trim();
+        const email = emailInput.value.trim();
+        const message = messageInput.value.trim();
+
+        if (!name || !email || !message || !email.includes('@')) {
+            alert('Please fill in all fields with a valid email.');
+            return;
+        }
+
+        try {
+            const leadData = {
+                name,
+                email,
+                createdAt: serverTimestamp(),
+                lastMessage: message,
+                status: 'New',
+                messages: [{ sender: 'user', text: message, timestamp: new Date() }]
+            };
+            const leadsCollection = collection(db, `artifacts/${APP_ID}/public/data/leads`);
+            const docRef = await addDoc(leadsCollection, leadData);
+            state.leadId = docRef.id;
+            state.leadCaptured = true;
+            localStorage.setItem(`chat_lead_id_${APP_ID}`, state.leadId);
+
+            addMessageToUI(message, 'user');
+            renderChatInput();
+            getAIResponse(message);
+
+        } catch (error) {
+            console.error("Error creating lead:", error);
+        }
+    }
+
+    async function handleSendMessage() {
+        const input = document.getElementById('chat-message-input');
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = '';
+
+        addMessageToUI(text, 'user');
+
+        try {
+            const leadRef = doc(db, `artifacts/${APP_ID}/public/data/leads`, state.leadId);
+            const leadSnap = await getDoc(leadRef);
+            if(leadSnap.exists()) {
+                const currentMessages = leadSnap.data().messages || [];
+                const updatedMessages = [...currentMessages, { sender: 'user', text, timestamp: new Date() }];
+                await setDoc(leadRef, {
+                    messages: updatedMessages,
+                    lastMessage: text
+                }, { merge: true });
+                
+                getAIResponse(text);
+            }
+        } catch (error) {
+            console.error("Error sending message:", error);
+        }
+    }
+
+    async function loadExistingLead() {
+        const savedLeadId = localStorage.getItem(`chat_lead_id_${APP_ID}`);
+        if (savedLeadId) {
+            state.leadId = savedLeadId;
+            const leadRef = doc(db, `artifacts/${APP_ID}/public/data/leads`, state.leadId);
+            const docSnap = await getDoc(leadRef);
+
+            if (docSnap.exists()) {
+                state.leadCaptured = true;
+                const messages = docSnap.data().messages || [];
+                const messagesContainer = document.getElementById('chat-messages');
+                // Clear initial message before loading history
+                messagesContainer.innerHTML = ''; 
+                messages.forEach(msg => addMessageToUI(msg.text, msg.sender));
+                renderChatInput();
+            } else {
+                localStorage.removeItem(`chat_lead_id_${APP_ID}`);
+                state.leadId = null;
+                renderLeadForm();
+            }
+        }
+    }
+    
+    // --- 8. AI INTEGRATION ---
+     async function fetchWebsiteUrl() {
+        try {
+            const configRef = doc(db, `artifacts/${APP_ID}/public/data/config`, 'settings');
+            const docSnap = await getDoc(configRef);
+            if (docSnap.exists() && docSnap.data().websiteUrl) {
+                state.websiteUrlForAI = docSnap.data().websiteUrl;
+            }
+        } catch (error) {
+            console.error("Error fetching website URL for AI:", error);
+        }
+    }
+
+    async function getAIResponse(userQuery) {
+        if (!state.websiteUrlForAI) {
+            addMessageToUI("I'm sorry, I'm not configured to answer questions yet. A human agent will be with you shortly.", 'agent');
+            return;
+        }
+
+        showAITyping(true);
+
+        const apiKey = ""; // API key is handled by the environment
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+        
+        const payload = {
+            contents: [{
+                parts: [{ text: `Based *only* on the content from the website ${state.websiteUrlForAI}, answer the following user question: "${userQuery}". If the answer isn't on the site, say "I couldn't find an answer on the website, but one of our agents can help."` }]
+            }],
+            tools: [{ "google_search": { "type": "WEBSITE", "uris": [state.websiteUrlForAI] } }],
+        };
+
+        try {
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                 throw new Error(`API call failed with status: ${response.status}`);
+            }
+
+            const result = await response.json();
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "I'm having trouble connecting right now. An agent will be with you shortly.";
+            
+            showAITyping(false);
+            addMessageToUI(text, 'agent');
+            
+            // Save AI response to Firestore
+            const leadRef = doc(db, `artifacts/${APP_ID}/public/data/leads`, state.leadId);
+            const leadSnap = await getDoc(leadRef);
+             if(leadSnap.exists()) {
+                const currentMessages = leadSnap.data().messages || [];
+                const updatedMessages = [...currentMessages, { sender: 'agent', text: text, timestamp: new Date() }];
+                await setDoc(leadRef, { messages: updatedMessages }, { merge: true });
+            }
+
+        } catch (error) {
+            console.error("Error getting AI response:", error);
+            showAITyping(false);
+            addMessageToUI("My apologies, I encountered an error. A human will assist you.", 'agent');
+        }
+    }
+
+    // --- 9. INITIALIZATION ---
+    function init() {
+        // Wait for the DOM to be fully loaded before creating UI
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => {
+                 createChatUI();
+                 addEventListeners();
+                 initializeFirebase();
+            });
+        } else {
+            createChatUI();
+            addEventListeners();
+            initializeFirebase();
+        }
+    }
+    
+    init();
+
+})();
+
